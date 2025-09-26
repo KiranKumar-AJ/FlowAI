@@ -34,32 +34,58 @@ app.use(express.json({ limit: '1mb' }));
 // WARNING: Hardcoding keys in code is insecure. Use only for quick local demos.
 // Replace the placeholder below with your actual key OR use env GEMINI_API_KEY.
 // NOTE: Leave empty before committing to GitHub.
-const HARDCODED_GEMINI_KEY = '';
+const HARDCODED_GEMINI_KEY = 'AIzaSyAEk5qxq_mv_EnmhL-kHGFIWLMP3llz1hY';
 
 const effectiveGeminiKey = HARDCODED_GEMINI_KEY || process.env.GEMINI_API_KEY;
 const genAI = effectiveGeminiKey ? new GoogleGenerativeAI(effectiveGeminiKey) : null;
 
 function systemPrompt(diagramType) {
-  const examples = {
-    flowchart: `You convert natural language descriptions into valid Mermaid flowcharts. Output ONLY Mermaid code. No backticks, no explanations.
-Use the format:
+  const prompts = {
+    flowchart: `Task: Convert a plain English project/process description into a VALID Mermaid flowchart. Output ONLY Mermaid code (no backticks, no extra text).
+
+Requirements:
+- Start with: flowchart TD
+- Extract clear steps and decision points from the description. Do not require user-provided arrows.
+- Use rectangles for actions and diamonds for decisions with labeled branches (e.g., Yes/No).
+- Create simple, readable node labels (Title Case). Use stable IDs (n1, n2, n3...).
+- Prefer a single start and end if the description implies them.
+- Keep it concise (5–12 nodes unless description is very long).
+- Absolutely no commentary, backticks, or markdown.
+
+Example style:
 flowchart TD
-A[Start] --> B{Check}
-B -- Yes --> C[Do X]
-B -- No --> D[Do Y]
-C --> E[End]
-D --> E[End]
-` ,
-    sequence: `You convert natural language descriptions into valid Mermaid sequence diagrams. Output ONLY Mermaid code. No backticks, no explanations.
-Use the format:
+  n1([Start]) --> n2[Collect Requirements]
+  n2 --> n3{Requirements Clear?}
+  n3 -- Yes --> n4[Design Architecture]
+  n3 -- No --> n2
+  n4 --> n5[Implement Features]
+  n5 --> n6[Test & QA]
+  n6 --> n7([End])
+`,
+    sequence: `Task: Convert a plain English system description into a VALID Mermaid sequence diagram. Output ONLY Mermaid code (no backticks, no extra text).
+
+Requirements:
+- Start with: sequenceDiagram
+- Declare obvious participants from the description (e.g., User, Frontend, Backend, DB, ExternalService).
+- Turn the described flow into messages between participants with short, imperative labels.
+- Keep 5–12 messages unless the description is very long.
+- Absolutely no commentary, backticks, or markdown.
+
+Example style:
 sequenceDiagram
-participant U as User
-participant S as System
-U->>S: Ask
-S-->>U: Answer
+  participant U as User
+  participant FE as Frontend
+  participant BE as Backend
+  participant DB as Database
+  U->>FE: Submit request
+  FE->>BE: Validate & forward
+  BE->>DB: Read/Write data
+  DB-->>BE: Result
+  BE-->>FE: Response
+  FE-->>U: Show outcome
 `
   };
-  return examples[diagramType] || examples.flowchart;
+  return prompts[diagramType] || prompts.flowchart;
 }
 
 app.post('/api/generate', async (req, res) => {
