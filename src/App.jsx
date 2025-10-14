@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import Diagram from './components/Diagram.jsx';
-import { generateMermaidWithAI } from './api/llmClient.js';
+import { generateMermaidWithAI, chatRefine, chatRefineStream } from './api/llmClient.js';
+import ChatPanel from './components/ChatPanel.jsx';
 import './index.css';
 
 const examples = {
@@ -44,6 +45,11 @@ export default function App() {
 	const [code, setCode] = useState(() => mockLLMToMermaid('Start -> Validate -> Process -> Save -> End', 'flowchart'));
 	const [activeTab, setActiveTab] = useState('preview');
 	const [renderInfo, setRenderInfo] = useState(null);
+	const [chatMessages, setChatMessages] = useState([
+		{ role: 'assistant', content: "Hello! I'm FlowAI, your intelligent assistant for streamlined workflows. I'll help you refine your process descriptions into clear, actionable specifications for generating beautiful diagrams. What would you like to work on today?" }
+	]);
+	const [chatStreaming, setChatStreaming] = useState(false);
+	const streamAbortRef = { current: null };
 
 	const generate = () => {
 		const m = mockLLMToMermaid(input, diagramType);
@@ -54,6 +60,79 @@ export default function App() {
 	const generateAI = async () => {
 		try {
 			const aiCode = await generateMermaidWithAI({ description: input, type: diagramType });
+			setCode(aiCode);
+			setActiveTab('preview');
+		} catch (e) {
+			alert('AI generation failed: ' + (e?.message || String(e)));
+		}
+	};
+
+	const sendChat = async (userText) => {
+		// Include current diagram context in the chat
+		const contextMessage = `Current diagram description: "${input}"`;
+		const newMessages = [...chatMessages, { role: 'system', content: contextMessage }, { role: 'user', content: userText }];
+		setChatMessages([...chatMessages, { role: 'user', content: userText }]);
+		try {
+			const reply = await chatRefine(newMessages);
+			setChatMessages(msgs => [...msgs, { role: 'assistant', content: reply }]);
+		} catch (e) {
+			setChatMessages(msgs => [...msgs, { role: 'assistant', content: 'Error: ' + (e?.message || String(e)) }]);
+		}
+	};
+
+	const startChatStream = (userText) => {
+		const text = userText.trim();
+		if (!text || chatStreaming) return;
+		// Include current diagram context in the chat
+		const contextMessage = `Current diagram description: "${input}"`;
+		const base = [...chatMessages, { role: 'system', content: contextMessage }, { role: 'user', content: text }];
+		setChatMessages([...chatMessages, { role: 'user', content: text }]);
+		setChatStreaming(true);
+		let acc = '';
+		const stop = chatRefineStream(
+			base,
+			(chunk) => {
+				acc += chunk;
+				setChatMessages(msgs => {
+					const last = msgs[msgs.length - 1];
+					if (last && last.role === 'assistant') {
+						const copy = msgs.slice();
+						copy[copy.length - 1] = { role: 'assistant', content: acc };
+						return copy;
+					}
+					return [...msgs, { role: 'assistant', content: acc }];
+				});
+			},
+			(finalText) => {
+				if (!finalText && acc) finalText = acc;
+				setChatStreaming(false);
+				streamAbortRef.current = null;
+			},
+			(errMsg) => {
+				setChatStreaming(false);
+				streamAbortRef.current = null;
+				setChatMessages(msgs => [...msgs, { role: 'assistant', content: 'Error: ' + errMsg }]);
+			}
+		);
+		streamAbortRef.current = stop;
+	};
+
+	const stopChatStream = () => {
+		if (streamAbortRef.current) {
+			try { streamAbortRef.current(); } catch {}
+			streamAbortRef.current = null;
+		}
+		setChatStreaming(false);
+	};
+
+	const useAsPrompt = (text) => {
+		setInput(text);
+	};
+
+	const updateDiagramFromText = async (text) => {
+		setInput(text);
+		try {
+			const aiCode = await generateMermaidWithAI({ description: text, type: diagramType });
 			setCode(aiCode);
 			setActiveTab('preview');
 		} catch (e) {
@@ -145,17 +224,32 @@ export default function App() {
 						<button className={activeTab === 'preview' ? 'active' : ''} onClick={() => setActiveTab('preview')}>
 							Preview
 						</button>
-						<button className={activeTab === 'code' ? 'active' : ''} onClick={() => setActiveTab('code')}>
+					<button className={activeTab === 'code' ? 'active' : ''} onClick={() => setActiveTab('code')}>
 							Code
 						</button>
+					<button className={activeTab === 'chat' ? 'active' : ''} onClick={() => setActiveTab('chat')}>
+						Chat
+					</button>
 					</div>
 
 					{activeTab === 'preview' ? (
 						<div className="preview">
 							<Diagram code={code} onRender={setRenderInfo} />
 						</div>
-					) : (
+					) : activeTab === 'code' ? (
 						<textarea className="code" value={code} onChange={e => setCode(e.target.value)} />
+					) : (
+						<div className="preview" style={{ display: 'flex', flexDirection: 'column' }}>
+							<ChatPanel
+								onSend={sendChat}
+								messages={chatMessages}
+								onUse={useAsPrompt}
+								onUpdate={updateDiagramFromText}
+								streaming={chatStreaming}
+								onStartStream={startChatStream}
+								onStopStream={stopChatStream}
+							/>
+						</div>
 					)}
 				</section>
 			</main>

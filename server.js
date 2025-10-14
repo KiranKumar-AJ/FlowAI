@@ -34,9 +34,9 @@ app.use(express.json({ limit: '1mb' }));
 // WARNING: Hardcoding keys in code is insecure. Use only for quick local demos.
 // Replace the placeholder below with your actual key OR use env GEMINI_API_KEY.
 // NOTE: Leave empty before committing to GitHub.
-const HARDCODED_GEMINI_KEY = 'AIzaSyAEk5qxq_mv_EnmhL-kHGFIWLMP3llz1hY';
+const HARDCODED_GEMINI_KEY = 'AIzaSyDRhUyzABZ_ULXUGMpDodrEFXDITeofF7I';
 
-const effectiveGeminiKey = HARDCODED_GEMINI_KEY || process.env.GEMINI_API_KEY;
+const effectiveGeminiKey = process.env.GEMINI_API_KEY || HARDCODED_GEMINI_KEY;
 const genAI = effectiveGeminiKey ? new GoogleGenerativeAI(effectiveGeminiKey) : null;
 
 function systemPrompt(diagramType) {
@@ -88,6 +88,29 @@ sequenceDiagram
   return prompts[diagramType] || prompts.flowchart;
 }
 
+async function generateWithRetry({ modelName, systemInstruction, userPrompt, attempts = 3, baseDelayMs = 600 }) {
+  const model = genAI.getGenerativeModel({ model: modelName, systemInstruction });
+  let lastErr = null;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      const resp = await model.generateContent(userPrompt);
+      const text = (resp && resp.response && resp.response.text && resp.response.text()) || '';
+      return text;
+    } catch (err) {
+      lastErr = err;
+      const status = err?.status || err?.statusCode;
+      const isTransient = status === 429 || status === 503 || String(err?.message || '').toLowerCase().includes('fetch') || String(err?.message || '').toLowerCase().includes('overloaded');
+      if (i < attempts - 1 && isTransient) {
+        const delay = baseDelayMs * Math.pow(2, i) + Math.floor(Math.random() * 200);
+        await new Promise(r => setTimeout(r, delay));
+        continue;
+      }
+      break;
+    }
+  }
+  throw lastErr || new Error('Generation failed');
+}
+
 app.post('/api/generate', async (req, res) => {
   try {
     const { description, type } = req.body || {};
@@ -101,16 +124,148 @@ app.post('/api/generate', async (req, res) => {
       return res.status(500).json({ error: 'Gemini key not configured. Set HARDCODED_GEMINI_KEY or GEMINI_API_KEY.' });
     }
     const requestedModel = (req.body && req.body.model) || '';
-    const modelName = requestedModel || process.env.GEMINI_MODEL || 'gemini-2.5-pro';
-    const model = genAI.getGenerativeModel({ model: modelName, systemInstruction: sys });
-    const resp = await model.generateContent(user);
-    const resultText = (resp && resp.response && resp.response.text && resp.response.text()) || '';
+    const primaryModel = requestedModel || process.env.GEMINI_MODEL || 'gemini-2.5-pro';
+    const fallbackModel = process.env.GEMINI_FALLBACK_MODEL || 'gemini-1.5-flash';
+
+    let resultText = '';
+    try {
+      resultText = await generateWithRetry({ modelName: primaryModel, systemInstruction: sys, userPrompt: user, attempts: 3 });
+    } catch (primaryErr) {
+      const status = primaryErr?.status || primaryErr?.statusCode;
+      const canFallback = status === 429 || status === 503 || String(primaryErr?.message || '').toLowerCase().includes('overloaded');
+      if (canFallback && fallbackModel && fallbackModel !== primaryModel) {
+        try {
+          resultText = await generateWithRetry({ modelName: fallbackModel, systemInstruction: sys, userPrompt: user, attempts: 3 });
+        } catch (fallbackErr) {
+          console.error('LLM error (fallback failed):', fallbackErr);
+          return res.status(503).json({ error: 'Provider overloaded. Please retry shortly.', detail: fallbackErr?.message || String(fallbackErr) });
+        }
+      } else {
+        console.error('LLM error (no fallback):', primaryErr);
+        const httpStatus = status && Number.isInteger(status) ? status : 500;
+        return res.status(httpStatus).json({ error: 'Generation failed', detail: primaryErr?.message || String(primaryErr) });
+      }
+    }
 
     const cleaned = (resultText || '').replace(/^```[a-zA-Z]*\n?|```$/g, '').trim();
     return res.json({ code: cleaned });
   } catch (err) {
     console.error('LLM error:', err);
     res.status(500).json({ error: 'Generation failed', detail: err?.message || String(err) });
+  }
+});
+
+// Simple chat refinement endpoint: accepts messages [{role: 'user'|'assistant'|'system', content: string}]
+app.post('/api/chat', async (req, res) => {
+  try {
+    const { messages = [], model } = req.body || {};
+    if (!Array.isArray(messages) || messages.length === 0) {
+      return res.status(400).json({ error: 'Missing messages' });
+    }
+    if (!genAI) {
+      return res.status(500).json({ error: 'Gemini key not configured. Set HARDCODED_GEMINI_KEY or GEMINI_API_KEY.' });
+    }
+
+    const primaryModel = model || process.env.GEMINI_MODEL || 'gemini-2.5-pro';
+    const fallbackModel = process.env.GEMINI_FALLBACK_MODEL || 'gemini-1.5-flash';
+
+    // Compose a system instruction to steer refinements towards clear flowchart descriptions
+    const systemInstruction = `You are FlowAI, a helpful assistant that refines user descriptions into clear, short, unambiguous requirements suitable for generating Mermaid diagrams. 
+
+IMPORTANT: When the user asks to modify an existing diagram (like "add X after Y" or "insert Z between A and B"), you should:
+1. Preserve the existing flow structure
+2. Only add/modify the specific parts requested
+3. Keep all other steps intact
+4. Maintain the logical flow and connections
+
+For example, if the current flow is "Start -> Validate -> Process -> Save -> End" and user says "add requirement phase after start", the result should be "Start -> Requirements -> Validate -> Process -> Save -> End".
+
+Keep the language concise, actionable, and avoid code fences.`;
+    const userPrompt = messages.map(m => `${m.role.toUpperCase()}: ${m.content}`).join('\n');
+
+    let resultText = '';
+    try {
+      resultText = await generateWithRetry({ modelName: primaryModel, systemInstruction, userPrompt, attempts: 3 });
+    } catch (primaryErr) {
+      const status = primaryErr?.status || primaryErr?.statusCode;
+      const canFallback = status === 429 || status === 503 || String(primaryErr?.message || '').toLowerCase().includes('overloaded');
+      if (canFallback && fallbackModel && fallbackModel !== primaryModel) {
+        resultText = await generateWithRetry({ modelName: fallbackModel, systemInstruction, userPrompt, attempts: 3 });
+      } else {
+        throw primaryErr;
+      }
+    }
+
+    const cleaned = (resultText || '').replace(/^```[a-zA-Z]*\n?|```$/g, '').trim();
+    res.json({ message: cleaned });
+  } catch (err) {
+    console.error('Chat error:', err);
+    res.status(500).json({ error: 'Chat failed', detail: err?.message || String(err) });
+  }
+});
+
+// Streaming chat via Server-Sent Events
+app.post('/api/chat-stream', async (req, res) => {
+  try {
+    const { messages = [], model } = req.body || {};
+    if (!Array.isArray(messages) || messages.length === 0) {
+      return res.status(400).json({ error: 'Missing messages' });
+    }
+    if (!genAI) {
+      return res.status(500).json({ error: 'Gemini key not configured. Set HARDCODED_GEMINI_KEY or GEMINI_API_KEY.' });
+    }
+
+    const primaryModel = model || process.env.GEMINI_MODEL || 'gemini-2.5-pro';
+    const fallbackModel = process.env.GEMINI_FALLBACK_MODEL || 'gemini-1.5-flash';
+    const systemInstruction = `You are a helpful assistant that refines user descriptions into clear, short, unambiguous requirements suitable for generating Mermaid diagrams. Keep the language concise, actionable, and avoid code fences.`;
+    const userPrompt = messages.map(m => `${m.role.toUpperCase()}: ${m.content}`).join('\n');
+
+    // SSE headers
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+
+    const send = (event, data) => {
+      res.write(`event: ${event}\n`);
+      res.write(`data: ${data}\n\n`);
+    };
+
+    async function streamModel(modelName) {
+      const modelInst = genAI.getGenerativeModel({ model: modelName, systemInstruction });
+      const stream = await modelInst.generateContentStream(userPrompt);
+      for await (const chunk of stream.stream) {
+        const text = chunk?.text?.() || '';
+        if (text) send('chunk', JSON.stringify({ text }));
+      }
+      const aggregated = await stream.response;
+      const finalText = aggregated?.text?.() || '';
+      send('done', JSON.stringify({ text: finalText }));
+    }
+
+    try {
+      await streamModel(primaryModel);
+    } catch (primaryErr) {
+      const status = primaryErr?.status || primaryErr?.statusCode;
+      const canFallback = status === 429 || status === 503 || String(primaryErr?.message || '').toLowerCase().includes('overloaded');
+      if (canFallback && fallbackModel && fallbackModel !== primaryModel) {
+        try {
+          await streamModel(fallbackModel);
+        } catch (fallbackErr) {
+          send('error', JSON.stringify({ message: fallbackErr?.message || String(fallbackErr) }));
+        }
+      } else {
+        send('error', JSON.stringify({ message: primaryErr?.message || String(primaryErr) }));
+      }
+    }
+  } catch (err) {
+    // If headers not sent, send JSON; otherwise try SSE error
+    if (!res.headersSent) {
+      return res.status(500).json({ error: 'Chat failed', detail: err?.message || String(err) });
+    }
+    try {
+      res.write(`event: error\n`);
+      res.write(`data: ${JSON.stringify({ message: err?.message || String(err) })}\n\n`);
+    } catch {}
   }
 });
 
